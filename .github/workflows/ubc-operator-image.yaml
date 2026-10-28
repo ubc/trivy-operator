@@ -1,0 +1,87 @@
+name: Operator Image (UBC)
+
+# UBC-specific workflow: builds the trivy-operator image on `ubc-v*` tag pushes and
+# publishes it to ghcr.io/ubc/trivy-operator.
+#
+# The ubc/v* branches are an upstream release tag plus fixes that are still open
+# upstream (aquasecurity/trivy-operator#3117, #3121). Drop them once an upstream
+# release contains the fixes.
+#
+# Mirrors upstream's goreleaser build (CGO off, GOEXPERIMENT=jsonv2,
+# build/trivy-operator/Dockerfile) for linux/amd64 only, the one architecture our
+# clusters run. Upstream's release.yaml triggers on `v*` tags, so the `ubc-` prefix
+# keeps it from running here.
+
+on:
+  push:
+    tags:
+      - 'ubc-v*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/ubc/trivy-operator
+
+jobs:
+  release:
+    name: Build & Push
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve image tag
+        id: resolve
+        # ubc-v0.35.0-ubc.1 -> 0.35.0-ubc.1
+        run: echo "tag=${GITHUB_REF_NAME#ubc-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test the patched packages
+        env:
+          GOEXPERIMENT: jsonv2
+        run: go test ./pkg/vulnerabilityreport/... ./pkg/kube/...
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: "0"
+          GOEXPERIMENT: jsonv2
+          GOOS: linux
+          GOARCH: amd64
+          VERSION: ${{ steps.resolve.outputs.tag }}
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o trivy-operator ./cmd/trivy-operator
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/trivy-operator/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.resolve.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ubc/trivy-operator
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.resolve.outputs.tag }}
+          provenance: mode=max
+          sbom: true
